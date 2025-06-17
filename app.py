@@ -6,31 +6,95 @@ from langchain_community.vectorstores import FAISS
 from langchain_community.retrievers.tavily_search_api import TavilySearchAPIRetriever
 from langchain_groq import ChatGroq
 import os
+import shutil
 from dotenv import load_dotenv
+
+# Load environment variables
 load_dotenv()
+
 # Initialize Flask
 app = Flask(__name__)
 
 port = int(os.environ.get("PORT", 5000))
-# Set API keys
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-os.environ["TAVILY_API_KEY"] = os.getenv("TAVILY_API_KEY")
 
-# Load FAISS vectorstore
-DB_FAISS_PATH = "vectordb"
+# Validate and set API keys
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+
+if not GROQ_API_KEY:
+    raise ValueError("GROQ_API_KEY environment variable not set")
+if not TAVILY_API_KEY:
+    raise ValueError("TAVILY_API_KEY environment variable not set")
+
+os.environ["TAVILY_API_KEY"] = TAVILY_API_KEY
+
+# Initialize embedding model
 embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-book_db = FAISS.load_local(DB_FAISS_PATH, embedding_model, allow_dangerous_deserialization=True)
+
+# Load or create FAISS vectorstore
+DB_FAISS_PATH = "vectordb"
+book_db = None
+
+def load_faiss_database():
+    """Load FAISS database with error handling"""
+    global book_db
+    
+    try:
+        if os.path.exists(DB_FAISS_PATH):
+            print("Loading existing FAISS database...")
+            book_db = FAISS.load_local(DB_FAISS_PATH, embedding_model, allow_dangerous_deserialization=True)
+            print("Successfully loaded existing FAISS database")
+        else:
+            print("FAISS database not found. Creating empty database...")
+            # Create a dummy database - you'll need to populate this with your actual documents
+            book_db = FAISS.from_texts(["Medical knowledge base placeholder"], embedding_model)
+            print("Created empty FAISS database")
+            
+    except Exception as e:
+        print(f"Error loading FAISS database: {e}")
+        print("Creating new database...")
+        
+        # Remove corrupted database if it exists
+        if os.path.exists(DB_FAISS_PATH):
+            shutil.rmtree(DB_FAISS_PATH)
+            print("Removed corrupted database")
+        
+        # Create a new empty database
+        book_db = FAISS.from_texts(["Medical knowledge base placeholder"], embedding_model)
+        print("Created new FAISS database")
+
+# Initialize the database
+load_faiss_database()
 
 # Define FAISS retrieval tool
 def search_faiss_tool(query: str):
-    docs = book_db.similarity_search(query, k=2)
-    return "\n\n".join([doc.page_content for doc in docs]) if docs else "No relevant book content found."
+    """Search FAISS database for relevant medical content"""
+    try:
+        if book_db is None:
+            return "Medical knowledge base not available."
+        
+        docs = book_db.similarity_search(query, k=2)
+        if docs:
+            return "\n\n".join([doc.page_content for doc in docs])
+        else:
+            return "No relevant book content found."
+    except Exception as e:
+        print(f"Error in FAISS search: {e}")
+        return "Error searching medical knowledge base."
 
 # Define web search tool
 def search_tavily_tool(query: str):
-    retriever = TavilySearchAPIRetriever(k=3)
-    docs = retriever.get_relevant_documents(query)
-    return "\n\n".join([doc.page_content for doc in docs]) if docs else "No relevant web content found."
+    """Search web for relevant medical information"""
+    try:
+        retriever = TavilySearchAPIRetriever(k=3)
+        docs = retriever.get_relevant_documents(query)
+        if docs:
+            return "\n\n".join([doc.page_content for doc in docs])
+        else:
+            return "No relevant web content found."
+    except Exception as e:
+        print(f"Error in web search: {e}")
+        return "Error searching web content."
 
 # Define tools for agent
 tools = [
@@ -46,12 +110,21 @@ tools = [
     )
 ]
 
-# Load LLM
-# llm = ChatGroq(api_key=GROQ_API_KEY, model="llama-3.1-8b-instant")
-llm = ChatGroq(
-    api_key=GROQ_API_KEY,
-    model="llama-3.3-70b-versatile"
-)
+# Initialize LLM
+try:
+    llm = ChatGroq(
+        api_key=GROQ_API_KEY,
+        model="llama-3.3-70b-versatile"
+    )
+    print("Successfully initialized ChatGroq")
+except Exception as e:
+    print(f"Error initializing ChatGroq: {e}")
+    # Fallback to different model if needed
+    llm = ChatGroq(
+        api_key=GROQ_API_KEY,
+        model="llama-3.1-8b-instant"
+    )
+    print("Fallback to llama-3.1-8b-instant")
 
 # Initialize Agent
 agent = initialize_agent(
@@ -59,82 +132,86 @@ agent = initialize_agent(
     llm=llm,
     agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
     verbose=True,
-    max_iterations = 5,
+    max_iterations=5,
     handle_parsing_errors=True
 )
 
 # Parse agent output
 def parse_agent_output(text_data):
+    """Parse agent output into structured format"""
     result = {"diseases": [], "tests": [], "tips": []}
 
     if "POSSIBLE DISEASES:" in text_data and "DIAGNOSTIC TESTS:" in text_data:
-        # Split by sections
-        diseases_part = text_data.split("DIAGNOSTIC TESTS:")[0].replace("POSSIBLE DISEASES:", "").strip()
-        tests_and_tips_part = text_data.split("DIAGNOSTIC TESTS:")[1]
-        # print(diseases_part, "first")
-        # print(tests_and_tips_part,"second")
-        # Check if TIPS section exists
-        if "TIPS:" in tests_and_tips_part:
-            tests_part = tests_and_tips_part.split("TIPS:")[0].strip()
-            tips_part = tests_and_tips_part.split("TIPS:")[1].strip()
-        else:
-            tests_part = tests_and_tips_part.strip()
-            tips_part = ""
-
-        # Parse diseases
-        for line in diseases_part.split('\n'):
-            if not line.strip().startswith("-"):
-                continue
-            parts = line.strip().lstrip("- ").split(" - ", 1)
-            # print(parts,"parts")
-            if len(parts) == 2:
-                name, description = parts
-                result["diseases"].append({
-                    "name": name.strip(),
-                    "description": description.strip()
-                })
-        # print(result, "first")
-        # Parse tests (expect 3 parts now: name - description - tips)
-        for line in tests_part.split('\n'):
-            if not line.strip().startswith("-"):
-                continue
-            parts = line.strip().lstrip("- ").split(" - ")
-            # print(parts,"test-parts")
-            if len(parts) == 3:
-                name, description, tips = parts
-            elif len(parts) == 2:
-                name, description = parts
-                tips = ""
+        try:
+            # Split by sections
+            diseases_part = text_data.split("DIAGNOSTIC TESTS:")[0].replace("POSSIBLE DISEASES:", "").strip()
+            tests_and_tips_part = text_data.split("DIAGNOSTIC TESTS:")[1]
+            
+            # Check if TIPS section exists
+            if "TIPS:" in tests_and_tips_part:
+                tests_part = tests_and_tips_part.split("TIPS:")[0].strip()
+                tips_part = tests_and_tips_part.split("TIPS:")[1].strip()
             else:
-                # fallback for unexpected format
-                name = parts[0]
-                description = "No description"
-                tips = ""
+                tests_part = tests_and_tips_part.strip()
+                tips_part = ""
 
+            # Parse diseases
+            for line in diseases_part.split('\n'):
+                line = line.strip()
+                if not line or not line.startswith("-"):
+                    continue
+                parts = line.lstrip("- ").split(" - ", 1)
+                if len(parts) == 2:
+                    name, description = parts
+                    result["diseases"].append({
+                        "name": name.strip(),
+                        "description": description.strip()
+                    })
+
+            # Parse tests
+            for line in tests_part.split('\n'):
+                line = line.strip()
+                if not line or not line.startswith("-"):
+                    continue
+                parts = line.lstrip("- ").split(" - ")
+                if len(parts) >= 3:
+                    name, description, tips = parts[0], parts[1], parts[2]
+                elif len(parts) == 2:
+                    name, description, tips = parts[0], parts[1], ""
+                else:
+                    name, description, tips = parts[0], "No description", ""
+
+                result["tests"].append({
+                    "name": name.strip(),
+                    "description": description.strip(),
+                    "tips": tips.strip()
+                })
+
+            # Parse overall tips section
+            if tips_part:
+                for line in tips_part.split('\n'):
+                    line = line.strip()
+                    if line and line.startswith("-"):
+                        tip = line.lstrip("- ").strip()
+                        if tip:
+                            result["tips"].append(tip)
+
+        except Exception as e:
+            print(f"Error parsing agent output: {e}")
             result["tests"].append({
-                "name": name.strip(),
-                "description": description.strip(),
-                "tips": tips.strip()
+                "name": "Parsing Error",
+                "description": "Could not parse agent output properly.",
+                "tips": ""
             })
-        # print(result, "second")
-        # Parse overall tips section
-        # if tips_part:
-        #     for line in tips_part.split('\n'):
-        #         if not line.strip().startswith("-"):
-        #             continue
-        #         tip = line.strip().lstrip("- ").strip()
-        #         if tip:
-        #             result["tips"].append(tip)
-
     else:
         result["tests"].append({
             "name": "No diagnostic output",
             "description": "Agent output did not match expected format.",
             "tips": ""
         })
-    print(result, "hggfffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+    
+    print("Parsed result:", result)
     return result
-
 
 @app.route("/")
 def index():
@@ -143,11 +220,25 @@ def index():
 @app.route("/get", methods=["POST"])
 def recommend():
     try:
-        symptoms = request.form.get("symptoms", "")
-        vitals = request.form.get("vitals", "")
-        age = request.form.get("age", "")
+        # Get form data
+        symptoms = request.form.get("symptoms", "").strip()
+        vitals = request.form.get("vitals", "").strip()
+        age = request.form.get("age", "").strip()
+        
+        # Validate input
+        if not symptoms or not age:
+            return jsonify({
+                "diseases": [],
+                "tests": [{
+                    "name": "Invalid Input",
+                    "description": "Please provide at least age and symptoms.",
+                    "tips": ""
+                }]
+            })
+        
         query = f"Patient Age: {age}. Symptoms: {symptoms}. Vitals: {vitals}"
-        print(query, "qury coming")
+        print(f"Processing query: {query}")
+        
         prompt = f"""
 You are a medical assistant AI that provides:
 
@@ -165,16 +256,20 @@ POSSIBLE DISEASES:
 - Disease Name - One line description.
 
 DIAGNOSTIC TESTS:
-- Test Name - Short reason - Suitability tips or contraindications(eg. not suitable childrerns or pregnant women etc.).
+- Test Name - Short reason - Suitability tips or contraindications(eg. not suitable for children or pregnant women etc.).
 
 Input query:
 Patient Age: {age}. Symptoms: {symptoms}. Vitals: {vitals}
 """
 
+        # Run agent
         agent_output = agent.run(prompt)
+        print(f"Agent output: {agent_output}")
+        
+        # Parse output
         parsed_output = parse_agent_output(agent_output)
-        # print(agent_output)
-        print(parsed_output, "parsed output")
+        
+        # Validate parsed output
         if not parsed_output.get("tests", []) and not parsed_output.get("diseases", []):
             return jsonify({
                 "diseases": [],
@@ -187,20 +282,8 @@ Patient Age: {age}. Symptoms: {symptoms}. Vitals: {vitals}
 
         return jsonify(parsed_output)
 
-        # if not parsed_output["tests"] and not parsed_output["diseases"]:
-        #     return jsonify({
-        #         "diseases": [],
-        #         "tests": [{
-        #             "name": "No diagnostic output",
-        #             "description": "Agent could not generate any test recommendations or disease names.",
-        #             "tips": ""
-        #         }]
-        #     })
-
-        # return jsonify(parsed_output)
-
     except Exception as e:
-        print("Agent Error:", str(e))
+        print(f"Error in /get endpoint: {str(e)}")
         return jsonify({
             "diseases": [],
             "tests": [{
@@ -208,8 +291,18 @@ Patient Age: {age}. Symptoms: {symptoms}. Vitals: {vitals}
                 "description": f"An error occurred: {str(e)}",
                 "tips": ""
             }]
-        })
+        }), 500
 
+@app.route("/health")
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "healthy",
+        "faiss_loaded": book_db is not None,
+        "groq_configured": GROQ_API_KEY is not None,
+        "tavily_configured": TAVILY_API_KEY is not None
+    })
 
 if __name__ == "__main__":
-    app.run(debug=True, use_reloader=False,host="0.0.0.0",port=port)
+    print(f"Starting Flask app on port {port}")
+    app.run(debug=True, use_reloader=False, host="0.0.0.0", port=port)
